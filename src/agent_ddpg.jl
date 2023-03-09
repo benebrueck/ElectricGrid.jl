@@ -4,79 +4,72 @@ using Zygote: ignore
 import CUDA: device
 using MacroTools: @forward
 
-Base.@kwdef struct DareAgent{P<:AbstractPolicy,T<:AbstractTrajectory} <: AbstractPolicy
-    policy::P
-    trajectory::T
-    hook
-end
-
-functor(x::DareAgent) = (policy = x.policy,), y -> @set x.policy = y.policy
-
-(agent::DareAgent)(env; training = false) = agent.policy(env; training)
-
-function check(agent::DareAgent, env::AbstractEnv)
-    if ActionStyle(env) === FULL_ACTION_SET &&
-       !haskey(agent.trajectory, :legal_actions_mask)
-    end
-    check(agent.policy, env)
-end
-
-Base.nameof(agent::DareAgent) = nameof(agent.policy)
-
-function (agent::DareAgent)(stage::AbstractStage, env::AbstractEnv, training = false)
-    training && update!(agent.trajectory, agent.policy, env, stage)
-    training && update!(agent.policy, agent.trajectory, env, stage)
-    agent.hook(stage, agent, env, training)
-end
-
-function (agent::DareAgent)(stage::PreExperimentStage, env::AbstractEnv, training = false)
-    training && update!(agent.policy, agent.trajectory, env, stage)
-    agent.hook(stage, agent, env, training)
-end
-
-function (agent::DareAgent)(stage::PreActStage, env::AbstractEnv, action, training = false)
-    training && update!(agent.trajectory, agent.policy, env, stage, action)
-    training && update!(agent.policy, agent.trajectory, env, stage)
-    agent.hook(stage, agent, env, action, training)
-end
-
-#remove training for all policies that do not define it
+#functions to make the training flag work for the whole RL framework
+(agent::Agent)(env::ElectricGridEnv, training::Bool) = agent.policy(env, training)
+(p::NamedPolicy)(env::ElectricGridEnv, training::Bool) = p.policy(env, p.name, training)
 (policy::AbstractPolicy)(env, training::Bool) = policy(env)
 (policy::AbstractPolicy)(env, name::Union{Nothing, String}, training::Bool) = policy(env, name)
 (policy::AbstractPolicy)(stage::AbstractStage, env::AbstractEnv, training::Bool) = policy(stage, env)
 (policy::AbstractPolicy)(stage::AbstractStage, env::AbstractEnv, action, training::Bool) = policy(stage, env, action)
 
 
-Base.@kwdef struct DareNeuralNetworkApproximator{M,O} <: AbstractApproximator
+#re-definition needed to use JEG-internal action-space functions
+function RLBase.update!(
+        trajectory::AbstractTrajectory,
+        policy::AbstractPolicy,
+        env::ElectricGridEnv,
+        ::PostEpisodeStage,
+    )
+    # Note that for trajectories like `CircularArraySARTTrajectory`, data are
+    # stored in a SARSA format, which means we still need to generate a dummy
+    # action at the end of an episode.
+
+    s = policy isa NamedPolicy ? state(env, nameof(policy)) : state(env)
+
+    A = policy isa NamedPolicy ? action_space(env, nameof(policy)) : action_space(env)
+    a = rand(A)
+
+    push!(trajectory[:state], s)
+    push!(trajectory[:action], a)
+    if haskey(trajectory, :legal_actions_mask)
+        lasm =
+            policy isa NamedPolicy ? legal_action_space_mask(env, nameof(policy)) :
+            legal_action_space_mask(env)
+        push!(trajectory[:legal_actions_mask], lasm)
+    end
+end
+
+
+Base.@kwdef struct CustomNeuralNetworkApproximator{M,O} <: AbstractApproximator
     model::M
     optimizer::O = nothing
 end
 
 # some model may accept multiple inputs
-(app::DareNeuralNetworkApproximator)(args...; kwargs...) = app.model(args...; kwargs...)
+(app::CustomNeuralNetworkApproximator)(args...; kwargs...) = app.model(args...; kwargs...)
 
-@forward DareNeuralNetworkApproximator.model Flux.testmode!,
+@forward CustomNeuralNetworkApproximator.model Flux.testmode!,
 Flux.trainmode!,
 Flux.params,
 device
 
-functor(x::DareNeuralNetworkApproximator) =
-    (model=x.model,), y -> DareNeuralNetworkApproximator(y.model, x.optimizer)
+functor(x::CustomNeuralNetworkApproximator) =
+    (model=x.model,), y -> CustomNeuralNetworkApproximator(y.model, x.optimizer)
 
-RLBase.update!(app::DareNeuralNetworkApproximator, gs) =
+RLBase.update!(app::CustomNeuralNetworkApproximator, gs) =
     Flux.Optimise.update!(app.optimizer, Flux.params(app), gs)
 
-Base.copyto!(dest::DareNeuralNetworkApproximator, src::DareNeuralNetworkApproximator) =
+Base.copyto!(dest::CustomNeuralNetworkApproximator, src::CustomNeuralNetworkApproximator) =
     Flux.loadparams!(dest.model, Flux.params(src))
 
-mutable struct DareDDPGPolicy{
-    BA<:DareNeuralNetworkApproximator,
-    BC<:DareNeuralNetworkApproximator,
-    TA<:DareNeuralNetworkApproximator,
-    TC<:DareNeuralNetworkApproximator,
-    P,
-    R<:AbstractRNG,
-} <: AbstractPolicy
+mutable struct CustomDDPGPolicy{
+        BA<:CustomNeuralNetworkApproximator,
+        BC<:CustomNeuralNetworkApproximator,
+        TA<:CustomNeuralNetworkApproximator,
+        TC<:CustomNeuralNetworkApproximator,
+        P,
+        R<:AbstractRNG,
+    } <: AbstractPolicy
 
     behavior_actor::BA
     behavior_critic::BC
@@ -99,7 +92,7 @@ mutable struct DareDDPGPolicy{
     critic_loss::Float32
 end
 
-Flux.functor(x::DareDDPGPolicy) = (
+Flux.functor(x::CustomDDPGPolicy) = (
     ba = x.behavior_actor,
     bc = x.behavior_critic,
     ta = x.target_actor,
@@ -112,28 +105,28 @@ y -> begin
     x = @set x.target_critic = y.tc
     x
 end
-    
-function DareDDPGPolicy(;
-    behavior_actor,
-    behavior_critic,
-    target_actor,
-    target_critic,
-    start_policy,
-    γ = 0.99f0,
-    ρ = 0.995f0,
-    na = 1,
-    batch_size = 32,
-    start_steps = 10000,
-    update_after = 1000,
-    update_freq = 50,
-    act_limit = 1.0,
-    act_noise = 0.1,
-    update_step = 0,
-    rng = Random.GLOBAL_RNG,
-)
+
+function CustomDDPGPolicy(;
+        behavior_actor,
+        behavior_critic,
+        target_actor,
+        target_critic,
+        start_policy,
+        γ = 0.99f0,
+        ρ = 0.995f0,
+        na = 1,
+        batch_size = 32,
+        start_steps = 10000,
+        update_after = 1000,
+        update_freq = 50,
+        act_limit = 1.0,
+        act_noise = 0.1,
+        update_step = 0,
+        rng = Random.GLOBAL_RNG,
+    )
     copyto!(behavior_actor, target_actor)  # force sync
     copyto!(behavior_critic, target_critic)  # force sync
-    DareDDPGPolicy(
+    CustomDDPGPolicy(
         behavior_actor,
         behavior_critic,
         target_actor,
@@ -155,11 +148,11 @@ function DareDDPGPolicy(;
     )
 end
 
-function (::DareDDPGPolicy)(::AbstractStage, ::AbstractEnv)
+function (::CustomDDPGPolicy)(::AbstractStage, ::AbstractEnv)
     nothing
 end
 
-function (p::DareDDPGPolicy)(env::SimEnv, name::Any = nothing, training = false)
+function (p::CustomDDPGPolicy)(env::ElectricGridEnv, name::Union{Nothing, String} = nothing, training::Bool = false)
     p.update_step += 1
 
     if p.update_step <= p.start_steps
@@ -180,18 +173,18 @@ function (p::DareDDPGPolicy)(env::SimEnv, name::Any = nothing, training = false)
 end
 
 function RLBase.update!(
-    p::DareDDPGPolicy,
-    traj::CircularArraySARTTrajectory,
-    ::AbstractEnv,
-    ::PreActStage,
-)
+        p::CustomDDPGPolicy,
+        traj::CircularArraySARTTrajectory,
+        ::AbstractEnv,
+        ::PreActStage,
+    )
     length(traj) > p.update_after || return
     p.update_step % p.update_freq == 0 || return
     inds, batch = sample(p.rng, traj, BatchSampler{SARTS}(p.batch_size))
     RLBase.update!(p, batch)
 end
 
-function RLBase.update!(p::DareDDPGPolicy, batch::NamedTuple{SARTS})
+function RLBase.update!(p::CustomDDPGPolicy, batch::NamedTuple{SARTS})
     s, a, r, t, s′ = send_to_device(device(p), batch)
 
     A = p.behavior_actor
@@ -237,42 +230,42 @@ function RLBase.update!(p::DareDDPGPolicy, batch::NamedTuple{SARTS})
         dest .= ρ .* dest .+ (1 - ρ) .* src
     end
 end
-    
+
 
 # also in a sep src
 
 global rngg = StableRNG(123)
 global initt = Flux.glorot_uniform(rngg)
 
-global create_actor(na, ns) = Chain(
+global CreateActor(na, ns) = Chain(
     Dense(ns, 20, relu; init = initt),
     Dense(20, 10, relu; init = initt),
     Dense(10, na, tanh; init = initt),
 )
 
-global create_critic(na, ns) = Chain(
+global CreateCritic(na, ns) = Chain(
     Dense(ns + na, 20, relu; init = initt),
     Dense(20, 10, relu; init = initt),
     Dense(10, 1; init = initt),
 )
 
-function create_agent_ddpg(;na, ns, batch_size = 32, use_gpu = true)
-    DareAgent(
-        policy = DareDDPGPolicy(
-            behavior_actor = DareNeuralNetworkApproximator(
-                model = use_gpu ? create_actor(na, ns) |> gpu : create_actor(na, ns),
+function CreateAgentDdpg(;na, ns, batch_size = 32, use_gpu = true)
+    Agent(
+        policy = CustomDDPGPolicy(
+            behavior_actor = CustomNeuralNetworkApproximator(
+                model = use_gpu ? CreateActor(na, ns) |> gpu : CreateActor(na, ns),
                 optimizer = Flux.ADAM(),
             ),
-            behavior_critic = DareNeuralNetworkApproximator(
-                model = use_gpu ? create_critic(na, ns) |> gpu : create_critic(na, ns),
+            behavior_critic = CustomNeuralNetworkApproximator(
+                model = use_gpu ? CreateCritic(na, ns) |> gpu : CreateCritic(na, ns),
                 optimizer = Flux.ADAM(),
             ),
-            target_actor = DareNeuralNetworkApproximator(
-                model = use_gpu ? create_actor(na, ns) |> gpu : create_actor(na, ns),
+            target_actor = CustomNeuralNetworkApproximator(
+                model = use_gpu ? CreateActor(na, ns) |> gpu : CreateActor(na, ns),
                 optimizer = Flux.ADAM(),
             ),
-            target_critic = DareNeuralNetworkApproximator(
-                model = use_gpu ? create_critic(na, ns) |> gpu : create_critic(na, ns),
+            target_critic = CustomNeuralNetworkApproximator(
+                model = use_gpu ? CreateCritic(na, ns) |> gpu : CreateCritic(na, ns),
                 optimizer = Flux.ADAM(),
             ),
             γ = 0.999f0,
@@ -281,7 +274,7 @@ function create_agent_ddpg(;na, ns, batch_size = 32, use_gpu = true)
             batch_size = batch_size,
             start_steps = -1,
             start_policy = RandomPolicy(-1.0..1.0; rng = rngg),
-            update_after = 50, #1000 
+            update_after = 50, #1000
             update_freq = 10,
             act_limit = 1.0,
             act_noise = 0.032,
@@ -292,9 +285,5 @@ function create_agent_ddpg(;na, ns, batch_size = 32, use_gpu = true)
             state = Vector{Float32} => (ns,),
             action = Float32 => (na, ),
         ),
-        hook = DataHook(
-            is_inner_hook_RL = true
-        ),
     )
 end
-
