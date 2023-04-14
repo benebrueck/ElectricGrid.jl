@@ -217,7 +217,7 @@ for more information.
 
 
 
-Next we define some the values of the components:
+Next we define some of the values of the components:
 
 
 ```julia
@@ -317,7 +317,7 @@ uu = [u for i = 1:ni ]
 uuu = mapreduce(permutedims, vcat, uu);
 ```
 
-To use `lsim()` you need defined initial states `x0`, a time vector `t` and a input signal `u`. In our case we apply a jump to 230 V to the system.
+To use `lsim()` we need defined initial states `x0`, a time vector `t` and a input signal `u`. In our case we apply a jump to 230 V to the system.
 
 
 ```julia
